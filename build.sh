@@ -24,6 +24,9 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$SCRIPT_DIR/target}"
 
+# Ensure rust-src component is installed for -Z build-std=core
+rustup component add rust-src --toolchain nightly 2>/dev/null || true
+
 echo "[1/2] Building eBPF program (bpfel-unknown-none)..."
 cd "$SCRIPT_DIR/process-monitor-ebpf"
 RUSTFLAGS="-C link-arg=-z -C link-arg=note-got" \
