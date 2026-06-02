@@ -1,213 +1,327 @@
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
-use aya::{
-    programs::BtfTracePoint,
-    Bpf, Btf,
-};
-use aya::maps::perf::PerfBufferReader;
-use aya::maps::PerfEventArray;
+use aya::maps::perf::AsyncPerfEventArray;
+use aya::programs::TracePoint;
+use aya::util::online_cpus;
+use aya::{Ebpf, Pod};
+use bytes::BytesMut;
 use chrono::Local;
 use clap::Parser;
 use colored::*;
-use log::{info, warn, error};
-use std::{
-    collections::HashMap,
-    sync::Arc,
-    time::{Duration, Instant},
-};
-use tokio::sync::Mutex;
+use log::{error, info};
+use serde::Serialize;
+use tokio::sync::broadcast;
 
-const EVENT_EXECVE: u8 = 0;
-const EVENT_OPENAT: u8 = 1;
-const EVENT_COMM_LEN: usize = 16;
-const EVENT_FILENAME_LEN: usize = 64;
-
-#[repr(C)]
-struct ProcessEvent {
-    event_type: u8,
-    pid: u32,
-    uid: u32,
-    comm: [i8; EVENT_COMM_LEN],
-    filename: [i8; EVENT_FILENAME_LEN],
-}
-
-unsafe impl aya::Pod for ProcessEvent {}
-
-#[derive(Parser)]
-#[command(author, version, about = "Real-time process monitor using eBPF")]
+#[derive(Parser, Debug)]
 struct Args {
-    #[arg(short, long, default_value = "target/release/process-monitor-ebpf")]
+    #[arg(short, long, default_value = "target/bpfel-unknown-none/release/process-monitor-ebpf")]
     bpf: String,
 
-    #[arg(long, default_value = "50")]
-    alert_threshold: u64,
+    #[arg(long, default_value_t = 50)]
+    alert_threshold: u32,
 
-    #[arg(long)]
+    #[arg(long, default_value_t = false)]
     json: bool,
+
+    #[arg(long, default_value_t = false)]
+    serve: bool,
+
+    #[arg(long, default_value_t = 3030)]
+    port: u16,
 }
 
-#[derive(Debug, Clone)]
-struct FileOpenTracker {
-    count: u64,
-    window_start: Instant,
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+struct ProcessEvent {
+    event_type: u32,
+    pid: u32,
+    uid: u32,
+    comm: [u8; 16],
+    filename: [u8; 64],
+}
+
+unsafe impl Pod for ProcessEvent {}
+
+#[derive(Clone, Serialize)]
+struct EventJson {
+    time: String,
+    event: String,
+    pid: u32,
+    uid: u32,
+    comm: String,
+    file: String,
+    ransomware: bool,
+}
+
+struct RansomwareDetector {
+    open_counts: std::collections::HashMap<u32, (u64, u32)>,
+    alert_cooldown: std::collections::HashMap<u32, u64>,
+    threshold: u32,
+}
+
+impl RansomwareDetector {
+    fn new(threshold: u32) -> Self {
+        Self {
+            open_counts: std::collections::HashMap::new(),
+            alert_cooldown: std::collections::HashMap::new(),
+            threshold,
+        }
+    }
+
+    fn record_open(&mut self, pid: u32, now_secs: u64) -> bool {
+        let window = 5;
+        let entry = self.open_counts.entry(pid).or_insert((now_secs, 0));
+        if now_secs - entry.0 > window {
+            entry.0 = now_secs;
+            entry.1 = 0;
+        }
+        entry.1 += 1;
+        if entry.1 > self.threshold {
+            let can_warn = self
+                .alert_cooldown
+                .get(&pid)
+                .map(|last| now_secs - *last > 30)
+                .unwrap_or(true);
+            if can_warn {
+                self.alert_cooldown.insert(pid, now_secs);
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn comm_str(comm: &[u8; 16]) -> String {
+    String::from_utf8_lossy(&comm[..comm.iter().position(|&c| c == 0).unwrap_or(16)]).to_string()
+}
+
+fn filename_str(name: &[u8; 64]) -> String {
+    String::from_utf8_lossy(&name[..name.iter().position(|&c| c == 0).unwrap_or(64)]).to_string()
+}
+
+fn event_to_json(event: &ProcessEvent, risk: bool) -> EventJson {
+    let ts = Local::now().format("%H:%M:%S%.3f");
+    let kind = match event.event_type {
+        1 => "EXEC",
+        2 => "OPEN",
+        _ => "UNKN",
+    };
+    EventJson {
+        time: ts.to_string(),
+        event: kind.to_string(),
+        pid: event.pid,
+        uid: event.uid,
+        comm: comm_str(&event.comm),
+        file: filename_str(&event.filename),
+        ransomware: risk,
+    }
+}
+
+fn print_event(event: &ProcessEvent, risk: bool, json: bool) {
+    let ts = Local::now().format("%H:%M:%S%.3f");
+    let comm = comm_str(&event.comm);
+    let file = filename_str(&event.filename);
+    let kind = match event.event_type {
+        1 => "EXEC",
+        2 => "OPEN",
+        _ => "UNKN",
+    };
+
+    if json {
+        println!(
+            r#"{{"time":"{ts}","event":"{kind}","pid":{},"uid":{},"comm":"{comm}","file":"{file}","ransomware":{risk}}}"#,
+            event.pid, event.uid,
+        );
+        return;
+    }
+
+    let color = if risk {
+        format!("{kind}").red().bold()
+    } else {
+        match event.event_type {
+            1 => format!("{kind}").green(),
+            _ => format!("{kind}").cyan(),
+        }
+    };
+
+    println!(
+        "[{ts}] {color:<6} pid={pid:<7} uid={uid:<4} {comm} {file}",
+        color = color,
+        pid = event.pid,
+        uid = event.uid,
+        comm = comm,
+        file = file,
+    );
+
+    if risk {
+        eprintln!("[ALERT] pid={} comm={} opened {} files in 5s window", event.pid, comm, 50);
+    }
+}
+
+async fn handle_perf_buffer(
+    mut buf: aya::maps::perf::AsyncPerfEventArrayBuffer<aya::maps::MapData>,
+    mut detector: RansomwareDetector,
+    json: bool,
+    serve: bool,
+    tx: Option<broadcast::Sender<EventJson>>,
+    running: Arc<AtomicBool>,
+) -> Result<()> {
+    let mut out_bufs = (0..10)
+        .map(|_| BytesMut::with_capacity(4096))
+        .collect::<Vec<_>>();
+
+    while running.load(Ordering::Relaxed) {
+        let events = buf.read_events(&mut out_bufs).await?;
+
+        for i in 0..events.read {
+            let buf = &out_bufs[i];
+            if buf.len() < std::mem::size_of::<ProcessEvent>() {
+                continue;
+            }
+
+            let event: ProcessEvent =
+                unsafe { std::ptr::read(buf.as_ptr() as *const ProcessEvent) };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            let risk = if event.event_type == 2 {
+                detector.record_open(event.pid, now)
+            } else {
+                false
+            };
+
+            let ej = event_to_json(&event, risk);
+
+            if serve {
+                if let Some(ref tx) = tx {
+                    let _ = tx.send(ej.clone());
+                }
+            } else {
+                print_event(&event, risk, json);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
     let args = Args::parse();
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
 
-    println!("{}", "Halcyon Process Monitor v0.1.0".bold().cyan());
-    println!("{}", "eBPF-based process and file operation monitoring".dimmed());
-    println!("Alert threshold: {} opens/sec\n", args.alert_threshold);
+    ctrlc::set_handler(move || {
+        r.store(false, Ordering::SeqCst);
+    })
+    .context("failed to set Ctrl-C handler")?;
 
-    let btf = Btf::from_sys_fs()
-        .context("Failed to load BTF from /sys/kernel/debug/btf/vmlinux")?;
+    // -- eBPF setup --
+    info!("Loading eBPF program from {}", args.bpf);
+    let mut bpf = Ebpf::load_file(&args.bpf).context("failed to load eBPF object")?;
 
-    let mut bpf = Bpf::load_file(&args.bpf)
-        .context("Failed to load eBPF program")?;
-
-    let program: &mut BtfTracePoint = bpf
+    info!("Attaching sys_enter_execve tracepoint");
+    let program: &mut TracePoint = bpf
         .program_mut("sys_enter_execve")
-        .context("Failed to get execve program")?
+        .context("failed to get sys_enter_execve program")?
         .try_into()?;
-    program.load("sys_enter_execve", &btf)
-        .context("Failed to load execve tracepoint")?;
-    program.attach()
-        .context("Failed to attach execve tracepoint")?;
-    println!("{} sys_enter_execve", "✓".green());
+    program.load()?;
+    program.attach("syscalls", "sys_enter_execve")?;
 
-    let program: &mut BtfTracePoint = bpf
+    info!("Attaching sys_enter_openat tracepoint");
+    let program: &mut TracePoint = bpf
         .program_mut("sys_enter_openat")
-        .context("Failed to get openat program")?
+        .context("failed to get sys_enter_openat program")?
         .try_into()?;
-    program.load("sys_enter_openat", &btf)
-        .context("Failed to load openat tracepoint")?;
-    program.attach()
-        .context("Failed to attach openat tracepoint")?;
-    println!("{} sys_enter_openat", "✓".green());
+    program.load()?;
+    program.attach("syscalls", "sys_enter_openat")?;
 
-    let perf_map: PerfEventArray<ProcessEvent> = bpf
-        .map_mut("EVENTS")
-        .context("Failed to get EVENTS map")?
-        .try_into()?;
+    info!("Opening perf event array");
+    let mut perf_array: AsyncPerfEventArray<_> =
+        AsyncPerfEventArray::try_from(bpf.take_map("EVENTS").context("failed to get EVENTS map")?)?;
 
-    let tracker = Arc::new(Mutex::new(HashMap::<u32, FileOpenTracker>::new()));
+    // -- broadcast channel for serve mode --
+    let (tx, _rx) = broadcast::channel::<EventJson>(256);
 
-    let mut reader = perf_map
-        .reader(512)
-        .context("Failed to create perf buffer reader")?;
-    println!("{} Monitoring started. Press Ctrl+C to stop.\n", "▶".green());
+    let mut tasks = Vec::new();
 
-    let tracker_clone = tracker.clone();
-    let alert_threshold = args.alert_threshold;
-    let json_output = args.json;
+    for cpu_id in online_cpus().map_err(|(_, e)| e)? {
+        let buf = perf_array
+            .open(cpu_id, None)
+            .context(format!("failed to open perf buffer for CPU {cpu_id}"))?;
 
-    tokio::spawn(async move {
-        loop {
-            match reader.read_events(&mut |events| {
-                for event in events.iter() {
-                    let ts = Local::now().format("%H:%M:%S%.3f");
-                    match event.event_type {
-                        EVENT_EXECVE => {
-                            let comm = c_char_array_to_string(&event.comm);
-                            if json_output {
-                                println!(
-                                    r#"{{"ts":"{}","type":"exec","pid":{},"uid":{},"comm":"{}"}}"#,
-                                    ts, event.pid, event.uid, comm
-                                );
-                            } else {
-                                println!(
-                                    "{} {} [{}] {} {} {}",
-                                    ts,
-                                    "EXEC".bold().green(),
-                                    event.pid,
-                                    comm.bold(),
-                                    "by uid".dimmed(),
-                                    event.uid
-                                );
-                            }
-                        }
-                        EVENT_OPENAT => {
-                            let comm = c_char_array_to_string(&event.comm);
-                            let filename = c_char_array_to_string(&event.filename);
-                            let truncated = if filename.len() > 60 {
-                                format!("{}...", &filename[..57])
-                            } else {
-                                filename.clone()
-                            };
+        let detector = RansomwareDetector::new(args.alert_threshold);
+        let running = running.clone();
+        let tx = if args.serve { Some(tx.clone()) } else { None };
 
-                            let mut track = tracker_clone.blocking_lock();
-                            let entry = track.entry(event.pid).or_insert(FileOpenTracker {
-                                count: 0,
-                                window_start: Instant::now(),
-                            });
-
-                            if entry.window_start.elapsed() > Duration::from_secs(1) {
-                                entry.count = 0;
-                                entry.window_start = Instant::now();
-                            }
-                            entry.count += 1;
-
-                            if entry.count >= alert_threshold {
-                                warn!(
-                                    "{} SUSPICIOUS: Process {} ({}) opened {} files in 1s!",
-                                    "⚠".yellow(),
-                                    event.pid,
-                                    comm,
-                                    entry.count
-                                );
-                                entry.count = 0;
-                                entry.window_start = Instant::now();
-                            }
-
-                            if json_output {
-                                let escaped: String = filename
-                                    .chars()
-                                    .flat_map(|c| c.escape_default())
-                                    .collect();
-                                println!(
-                                    r#"{{"ts":"{}","type":"open","pid":{},"uid":{},"comm":"{}","file":"{}"}}"#,
-                                    ts, event.pid, event.uid, comm, escaped
-                                );
-                            } else if !filename.is_empty() {
-                                println!(
-                                    "{} {} [{}] {} \u{2192} {}",
-                                    ts,
-                                    "OPEN".bold().blue(),
-                                    event.pid,
-                                    comm.dimmed(),
-                                    truncated.dimmed()
-                                );
-                            }
-                        }
-                        _ => {
-                            if json_output {
-                                println!(r#"{{"ts":"{}","type":"unknown","pid":{}}}"#, ts, event.pid);
-                            }
-                        }
-                    }
-                }
-            }) {
-                Ok(_) => {}
-                Err(e) => {
-                    error!("Perf buffer error: {}", e);
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
+        tasks.push(tokio::spawn(async move {
+            if let Err(e) =
+                handle_perf_buffer(buf, detector, args.json, args.serve, tx, running).await
+            {
+                error!("Perf buffer task error: {e}");
             }
-        }
-    });
+        }));
+    }
 
-    tokio::signal::ctrl_c().await?;
-    println!();
-    info!("Shutting down...");
+    // -- serve mode: HTTP dashboard --
+    if args.serve {
+        let addr = SocketAddr::from(([0, 0, 0, 0], args.port));
+        info!("Starting web dashboard on http://{addr}");
+
+        let app = axum::Router::new()
+            .route("/", axum::routing::get(dashboard_handler))
+            .route("/events", axum::routing::get(sse_handler))
+            .with_state(tx.clone());
+
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        axum::serve(listener, app).await?;
+        return Ok(());
+    }
+
+    // -- CLI mode --
+    info!("Process monitor started. Press Ctrl+C to stop.");
+    println!("{}", "=".repeat(80));
+    println!("{:<9} {:<6} {:<12} {:<6} {:<16} {:<10}", "TIME", "EVENT", "PID", "UID", "COMM", "FILE");
+    println!("{}", "=".repeat(80));
+
+    for task in tasks {
+        task.await?;
+    }
+
     Ok(())
 }
 
-fn c_char_array_to_string(arr: &[i8]) -> String {
-    let bytes: Vec<u8> = arr
-        .iter()
-        .take_while(|&&c| c != 0)
-        .map(|&c| c as u8)
-        .collect();
-    String::from_utf8_lossy(&bytes).to_string()
+async fn dashboard_handler() -> axum::response::Html<&'static str> {
+    axum::response::Html(include_str!("../dashboard/index.html"))
+}
+
+use axum::extract::State;
+use axum::response::sse::{Event, Sse};
+use futures::stream::Stream;
+use std::convert::Infallible;
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::StreamExt;
+
+async fn sse_handler(
+    State(tx): State<broadcast::Sender<EventJson>>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let rx = tx.subscribe();
+    let stream = BroadcastStream::new(rx).filter_map(|result| match result {
+        Ok(event) => {
+            let data = serde_json::to_string(&event).unwrap_or_default();
+            Some(Ok(Event::default().data(data)))
+        }
+        Err(_) => None,
+    });
+    Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(std::time::Duration::from_secs(5))
+            .text("ping"),
+    )
 }

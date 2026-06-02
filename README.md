@@ -93,6 +93,15 @@ sudo ./target/release/process-monitor --alert-threshold 100
 
 # JSON output for log aggregation
 sudo ./target/release/process-monitor --json | jq .
+
+### Web Dashboard (real-time GUI)
+
+```bash
+sudo ./target/release/process-monitor --serve --alert-threshold 50
+# Open http://localhost:3030
+```
+
+Animated dashboard with live event log, open-rate chart, top process list, and ransomware alert overlay.
 ```
 
 ## Project Structure

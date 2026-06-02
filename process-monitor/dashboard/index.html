@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>eBPF Process Monitor</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: 'SF Mono', 'Fira Code', monospace; background: #0d1117; color: #c9d1d9; overflow: hidden; height: 100vh; }
+.header { background: linear-gradient(135deg, #1f2937, #111827); border-bottom: 1px solid #30363d; padding: 12px 20px; display: flex; align-items: center; gap: 16px; }
+.header h1 { font-size: 16px; font-weight: 600; background: linear-gradient(90deg, #58a6ff, #3fb950); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+.header .badge { font-size: 11px; padding: 2px 8px; border-radius: 10px; background: #21262d; border: 1px solid #30363d; color: #8b949e; }
+.stats-row { display: flex; gap: 12px; padding: 12px 20px; background: #161b22; border-bottom: 1px solid #21262d; }
+.stat-card { flex: 1; background: #0d1117; border: 1px solid #30363d; border-radius: 8px; padding: 12px; text-align: center; }
+.stat-card .value { font-size: 28px; font-weight: 700; color: #58a6ff; }
+.stat-card .label { font-size: 11px; color: #8b949e; margin-top: 2px; }
+.stat-card.rw .value { color: #f85149; }
+.main { display: flex; height: calc(100vh - 130px); }
+.log-panel { flex: 1; overflow-y: auto; padding: 8px; background: #0d1117; border-right: 1px solid #21262d; }
+.log-panel::-webkit-scrollbar { width: 6px; }
+.log-panel::-webkit-scrollbar-track { background: #0d1117; }
+.log-panel::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+.event { font-size: 12px; padding: 3px 8px; border-bottom: 1px solid #21262d; display: flex; gap: 8px; align-items: center; animation: fadeIn 0.2s ease; }
+@keyframes fadeIn { from { opacity: 0; transform: translateX(-10px); } to { opacity: 1; transform: translateX(0); } }
+.event .ts { color: #484f58; min-width: 80px; }
+.event .kind { padding: 1px 6px; border-radius: 4px; font-weight: 600; font-size: 11px; min-width: 40px; text-align: center; }
+.event .kind.exec { background: #0f2d1a; color: #3fb950; border: 1px solid #1a4a2a; }
+.event .kind.open { background: #0c2d48; color: #58a6ff; border: 1px solid #1a4a6a; }
+.event .pid { color: #d2a8ff; min-width: 60px; }
+.event .uid { color: #8b949e; min-width: 40px; }
+.event .comm { color: #f0883e; min-width: 120px; max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.event .file { color: #8b949e; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.event.ransomware { background: rgba(248,81,73,0.08); border-left: 3px solid #f85149; }
+.event.ransomware .kind.open { background: #3d1214; color: #f85149; border-color: #f85149; }
+.right-panel { width: 350px; background: #161b22; display: flex; flex-direction: column; }
+.chart-container { padding: 12px; border-bottom: 1px solid #21262d; height: 200px; }
+.chart-container h3 { font-size: 11px; color: #8b949e; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 1px; }
+#rateChart { width: 100%; height: 150px; }
+.proc-list { flex: 1; overflow-y: auto; padding: 8px; }
+.proc-list::-webkit-scrollbar { width: 6px; }
+.proc-list::-webkit-scrollbar-track { background: #161b22; }
+.proc-list::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+.proc-item { font-size: 11px; padding: 4px 8px; border-bottom: 1px solid #21262d; display: flex; gap: 6px; align-items: center; }
+.proc-item .pname { color: #f0883e; flex: 1; overflow: hidden; text-overflow: ellipsis; }
+.proc-item .ppid { color: #d2a8ff; min-width: 50px; }
+.proc-item .rate { min-width: 40px; text-align: right; font-weight: 600; }
+.proc-item .rate.warn { color: #f85149; }
+.proc-item .rate.ok { color: #3fb950; }
+.alert-overlay { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: rgba(248,81,73,0.95); color: #fff; padding: 24px 40px; border-radius: 12px; font-size: 18px; font-weight: 700; z-index: 1000; animation: alertPulse 0.5s ease 3; display: none; pointer-events: none; }
+@keyframes alertPulse { 0%,100% { transform: translate(-50%,-50%) scale(1); } 50% { transform: translate(-50%,-50%) scale(1.05); } }
+</style>
+</head>
+<body>
+<div class="alert-overlay" id="alertOverlay"></div>
+
+<div class="header">
+  <h1>&#9881; eBPF Process Monitor</h1>
+  <span class="badge" id="statusBadge">connecting...</span>
+  <span class="badge" id="eventCount">0 events</span>
+  <span class="badge" id="uptimeBadge">0s</span>
+</div>
+
+<div class="stats-row">
+  <div class="stat-card"><div class="value" id="statTotal">0</div><div class="label">Total Events</div></div>
+  <div class="stat-card"><div class="value" id="statExec">0</div><div class="label">Exec</div></div>
+  <div class="stat-card"><div class="value" id="statOpen">0</div><div class="label">Opens</div></div>
+  <div class="stat-card rw"><div class="value" id="statRansom">0</div><div class="label">Alerts</div></div>
+  <div class="stat-card"><div class="value" id="statProc">0</div><div class="label">Processes</div></div>
+</div>
+
+<div class="main">
+  <div class="log-panel" id="logPanel"></div>
+  <div class="right-panel">
+    <div class="chart-container">
+      <h3>Open Rate (ops/sec)</h3>
+      <canvas id="rateChart"></canvas>
+    </div>
+    <div class="proc-list" id="procList">
+      <div style="font-size:11px;color:#484f58;padding:8px;text-align:center;">Top processes by open rate</div>
+    </div>
+  </div>
+</div>
+
+<script>
+const logPanel = document.getElementById('logPanel');
+const procList = document.getElementById('procList');
+const alertOverlay = document.getElementById('alertOverlay');
+
+const canvas = document.getElementById('rateChart');
+const ctx = canvas.getContext('2d');
+let chartData = [];
+const MAX_CHART = 60;
+
+let totalEvents = 0, totalExec = 0, totalOpen = 0, totalRansom = 0, startTime = Date.now();
+let procMap = {};
+
+function resizeCanvas() {
+  const rect = canvas.parentElement.getBoundingClientRect();
+  canvas.width = canvas.clientWidth * 2;
+  canvas.height = canvas.clientHeight * 2;
+}
+resizeCanvas();
+window.addEventListener('resize', resizeCanvas);
+
+function drawChart() {
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  if (chartData.length < 2) return;
+  const max = Math.max(...chartData, 1);
+  const stepX = w / MAX_CHART;
+  ctx.beginPath();
+  ctx.strokeStyle = '#f85149';
+  ctx.lineWidth = 2;
+  const start = Math.max(0, chartData.length - MAX_CHART);
+  for (let i = start; i < chartData.length; i++) {
+    const x = (i - start) * stepX;
+    const y = h - (chartData[i] / max) * (h - 10) - 5;
+    i === start ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+  ctx.fillStyle = 'rgba(248,81,73,0.1)';
+  ctx.lineTo((chartData.length - start - 1) * stepX, h);
+  ctx.lineTo(0, h);
+  ctx.closePath();
+  ctx.fill();
+}
+
+function addLog(event) {
+  totalEvents++;
+  if (event.event == 'EXEC') totalExec++;
+  if (event.event == 'OPEN') totalOpen++;
+  if (event.ransomware) totalRansom++;
+
+  document.getElementById('statTotal').textContent = totalEvents;
+  document.getElementById('statExec').textContent = totalExec;
+  document.getElementById('statOpen').textContent = totalOpen;
+  document.getElementById('statRansom').textContent = totalRansom;
+  document.getElementById('eventCount').textContent = totalEvents + ' events';
+  document.getElementById('uptimeBadge').textContent = Math.floor((Date.now() - startTime)/1000) + 's';
+
+  const procKey = event.pid + '|' + event.comm;
+  if (!procMap[procKey]) procMap[procKey] = { pid: event.pid, comm: event.comm, opens: 0, last: Date.now() };
+  if (event.event == 'OPEN') {
+    procMap[procKey].opens++;
+    procMap[procKey].last = Date.now();
+  }
+
+  const el = document.createElement('div');
+  el.className = 'event' + (event.ransomware ? ' ransomware' : '');
+  el.innerHTML = '<span class="ts">' + event.time + '</span>'
+    + '<span class="kind ' + event.event.toLowerCase() + '">' + event.event + '</span>'
+    + '<span class="pid">' + event.pid + '</span>'
+    + '<span class="uid">' + event.uid + '</span>'
+    + '<span class="comm">' + event.comm + '</span>'
+    + '<span class="file" title="' + event.file + '">' + event.file + '</span>';
+  logPanel.insertBefore(el, logPanel.firstChild);
+
+  while (logPanel.children.length > 200) logPanel.removeChild(logPanel.lastChild);
+
+  if (event.ransomware) {
+    alertOverlay.textContent = '&#9888; RANSOMWARE ALERT: ' + event.comm + ' (PID ' + event.pid + ')';
+    alertOverlay.style.display = 'block';
+    setTimeout(() => alertOverlay.style.display = 'none', 2000);
+  }
+}
+
+function updateProcList() {
+  let items = Object.values(procMap).filter(p => Date.now() - p.last < 10000);
+  items.sort((a, b) => b.opens - a.opens);
+  items = items.slice(0, 20);
+
+  let html = '<div style="font-size:11px;color:#484f58;padding:4px 8px;display:flex;gap:6px;">'
+    + '<span style="flex:1">Process</span><span style="min-width:50px">PID</span><span style="min-width:40px;text-align:right">Opens</span></div>';
+  for (const p of items) {
+    html += '<div class="proc-item">'
+      + '<span class="pname">' + p.comm + '</span>'
+      + '<span class="ppid">' + p.pid + '</span>'
+      + '<span class="rate ' + (p.opens > 50 ? 'warn' : 'ok') + '">' + p.opens + '</span>'
+      + '</div>';
+  }
+  procList.innerHTML = html;
+}
+
+document.getElementById('statProc').textContent = Object.keys(procMap).length;
+
+// SSE connection
+const evtSource = new EventSource('/events');
+evtSource.onopen = () => {
+  document.getElementById('statusBadge').textContent = 'connected';
+  document.getElementById('statusBadge').style.color = '#3fb950';
+};
+evtSource.onerror = () => {
+  document.getElementById('statusBadge').textContent = 'disconnected';
+  document.getElementById('statusBadge').style.color = '#f85149';
+};
+evtSource.onmessage = (e) => {
+  try {
+    const event = JSON.parse(e.data);
+    addLog(event);
+    if (event.event == 'OPEN') {
+      const now = Math.floor(Date.now() / 1000);
+      chartData.push(1);
+      if (chartData.length > 200) chartData.shift();
+      drawChart();
+    }
+  } catch(err) {}
+};
+
+setInterval(() => {
+  const now = Math.floor(Date.now() / 1000);
+  chartData.push(0);
+  if (chartData.length > 200) chartData.shift();
+  drawChart();
+  updateProcList();
+  document.getElementById('statProc').textContent = Object.keys(procMap).length;
+}, 1000);
+</script>
+</body>
+</html>
