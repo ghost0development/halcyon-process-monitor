@@ -1,11 +1,13 @@
 #![no_std]
 #![no_main]
 
+use core::ptr::addr_of_mut;
+
 use aya_ebpf::{
-    macros::{tracepoint, map},
-    programs::TracePointContext,
+    macros::{map, tracepoint},
+    programs::BtfTracePointContext,
     maps::PerfEventArray,
-    helpers::{bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_get_current_comm},
+    helpers::bpf_get_current_comm,
 };
 
 pub const EVENT_EXECVE: u8 = 0;
@@ -26,14 +28,14 @@ pub struct ProcessEvent {
 pub static EVENTS: PerfEventArray<ProcessEvent> = PerfEventArray::new(0);
 
 #[tracepoint]
-pub fn sys_enter_execve(ctx: TracePointContext) -> u32 {
+pub fn sys_enter_execve(ctx: BtfTracePointContext) -> i32 {
     match unsafe { try_sys_enter_execve(ctx) } {
         Ok(ret) => ret,
         Err(_) => 0,
     }
 }
 
-unsafe fn try_sys_enter_execve(ctx: TracePointContext) -> Result<u32, u32> {
+unsafe fn try_sys_enter_execve(ctx: BtfTracePointContext) -> Result<i32, i32> {
     let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
     let uid = bpf_get_current_uid_gid() as u32;
 
@@ -45,16 +47,16 @@ unsafe fn try_sys_enter_execve(ctx: TracePointContext) -> Result<u32, u32> {
         filename: [0i8; EVENT_FILENAME_LEN],
     };
 
-    bpf_get_current_comm(
-        core::ptr::addr_of_mut!(event.comm).cast(),
-        EVENT_COMM_LEN as u32,
-    );
+    let raw_comm = bpf_get_current_comm().unwrap_or([0u8; 16]);
+    for (i, &b) in raw_comm.iter().enumerate() {
+        event.comm[i] = b as i8;
+    }
 
-    let filename_addr = ctx.arg(0) as *const i8;
-    if !filename_addr.is_null() {
+    let filename_ptr: *const i8 = ctx.arg(0);
+    if !filename_ptr.is_null() {
         core::ptr::copy_nonoverlapping(
-            filename_addr,
-            core::ptr::addr_of_mut!(event.filename).cast(),
+            filename_ptr,
+            addr_of_mut!(event.filename).cast(),
             EVENT_FILENAME_LEN,
         );
     }
@@ -64,14 +66,14 @@ unsafe fn try_sys_enter_execve(ctx: TracePointContext) -> Result<u32, u32> {
 }
 
 #[tracepoint]
-pub fn sys_enter_openat(ctx: TracePointContext) -> u32 {
+pub fn sys_enter_openat(ctx: BtfTracePointContext) -> i32 {
     match unsafe { try_sys_enter_openat(ctx) } {
         Ok(ret) => ret,
         Err(_) => 0,
     }
 }
 
-unsafe fn try_sys_enter_openat(ctx: TracePointContext) -> Result<u32, u32> {
+unsafe fn try_sys_enter_openat(ctx: BtfTracePointContext) -> Result<i32, i32> {
     let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
     let uid = bpf_get_current_uid_gid() as u32;
 
@@ -83,16 +85,16 @@ unsafe fn try_sys_enter_openat(ctx: TracePointContext) -> Result<u32, u32> {
         filename: [0i8; EVENT_FILENAME_LEN],
     };
 
-    bpf_get_current_comm(
-        core::ptr::addr_of_mut!(event.comm).cast(),
-        EVENT_COMM_LEN as u32,
-    );
+    let raw_comm = bpf_get_current_comm().unwrap_or([0u8; 16]);
+    for (i, &b) in raw_comm.iter().enumerate() {
+        event.comm[i] = b as i8;
+    }
 
-    let filename_addr = ctx.arg(1) as *const i8;
-    if !filename_addr.is_null() {
+    let filename_ptr: *const i8 = ctx.arg(1);
+    if !filename_ptr.is_null() {
         core::ptr::copy_nonoverlapping(
-            filename_addr,
-            core::ptr::addr_of_mut!(event.filename).cast(),
+            filename_ptr,
+            addr_of_mut!(event.filename).cast(),
             EVENT_FILENAME_LEN,
         );
     }

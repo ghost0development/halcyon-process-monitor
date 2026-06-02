@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use aya::{
-    programs::TracePoint,
-    Bpf,
+    programs::BtfTracePoint,
+    Bpf, Btf,
 };
 use aya::maps::perf::PerfBufferReader;
 use aya::maps::PerfEventArray;
@@ -60,26 +60,31 @@ async fn main() -> Result<()> {
     println!("{}", "eBPF-based process and file operation monitoring".dimmed());
     println!("Alert threshold: {} opens/sec\n", args.alert_threshold);
 
-    let bpf = Bpf::load_file(&args.bpf)
+    let btf = Btf::from_sys_fs()
+        .context("Failed to load BTF from /sys/kernel/debug/btf/vmlinux")?;
+
+    let mut bpf = Bpf::load_file(&args.bpf)
         .context("Failed to load eBPF program")?;
 
-    let program: &mut TracePoint = bpf
+    let program: &mut BtfTracePoint = bpf
         .program_mut("sys_enter_execve")
         .context("Failed to get execve program")?
         .try_into()?;
-    program.load()?;
-    program.attach("syscalls", "sys_enter_execve")
-        .context("Failed to attach execve")?;
-    println!("{} execve tracepoint", "✓".green());
+    program.load("sys_enter_execve", &btf)
+        .context("Failed to load execve tracepoint")?;
+    program.attach()
+        .context("Failed to attach execve tracepoint")?;
+    println!("{} sys_enter_execve", "✓".green());
 
-    let program: &mut TracePoint = bpf
+    let program: &mut BtfTracePoint = bpf
         .program_mut("sys_enter_openat")
         .context("Failed to get openat program")?
         .try_into()?;
-    program.load()?;
-    program.attach("syscalls", "sys_enter_openat")
-        .context("Failed to attach openat")?;
-    println!("{} openat tracepoint", "✓".green());
+    program.load("sys_enter_openat", &btf)
+        .context("Failed to load openat tracepoint")?;
+    program.attach()
+        .context("Failed to attach openat tracepoint")?;
+    println!("{} sys_enter_openat", "✓".green());
 
     let perf_map: PerfEventArray<ProcessEvent> = bpf
         .map_mut("EVENTS")
