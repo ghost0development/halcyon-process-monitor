@@ -29,7 +29,6 @@ rustup component add rust-src --toolchain nightly 2>/dev/null || true
 
 echo "[1/2] Building eBPF program (bpfel-unknown-none)..."
 cd "$SCRIPT_DIR/process-monitor-ebpf"
-RUSTFLAGS="-C link-arg=-z -C link-arg=note-got" \
 cargo +nightly build \
   --release \
   --target bpfel-unknown-none \
