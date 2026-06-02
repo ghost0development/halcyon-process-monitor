@@ -4,10 +4,14 @@
 use core::ptr::addr_of_mut;
 
 use aya_ebpf::{
-    macros::{map, tracepoint},
+    macros::{btf_tracepoint, map},
     programs::BtfTracePointContext,
     maps::PerfEventArray,
-    helpers::bpf_get_current_comm,
+    helpers::{
+        bpf_get_current_comm,
+        bpf_get_current_pid_tgid,
+        bpf_get_current_uid_gid,
+    },
 };
 
 pub const EVENT_EXECVE: u8 = 0;
@@ -27,7 +31,7 @@ pub struct ProcessEvent {
 #[map]
 pub static EVENTS: PerfEventArray<ProcessEvent> = PerfEventArray::new(0);
 
-#[tracepoint]
+#[btf_tracepoint(function = "sys_enter_execve")]
 pub fn sys_enter_execve(ctx: BtfTracePointContext) -> i32 {
     match unsafe { try_sys_enter_execve(ctx) } {
         Ok(ret) => ret,
@@ -65,7 +69,7 @@ unsafe fn try_sys_enter_execve(ctx: BtfTracePointContext) -> Result<i32, i32> {
     Ok(0)
 }
 
-#[tracepoint]
+#[btf_tracepoint(function = "sys_enter_openat")]
 pub fn sys_enter_openat(ctx: BtfTracePointContext) -> i32 {
     match unsafe { try_sys_enter_openat(ctx) } {
         Ok(ret) => ret,
