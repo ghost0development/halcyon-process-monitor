@@ -24,6 +24,14 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$SCRIPT_DIR/target}"
 
+# Ensure bpf-linker is installed for eBPF compilation
+if ! command -v bpf-linker >/dev/null 2>&1; then
+  echo "bpf-linker not found. Installing... (requires Rust LLVM tools)"
+  cargo install bpf-linker 2>&1
+fi
+
+export PATH="$HOME/.cargo/bin:$PATH"
+
 # Ensure rust-src component is installed for -Z build-std=core
 rustup component add rust-src --toolchain nightly 2>/dev/null || true
 
